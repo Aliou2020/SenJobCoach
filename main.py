@@ -264,15 +264,17 @@ def is_gibberish(text: str) -> bool:
 
 
 
-def detect_poste(text: str) -> bool:
+def detect_poste_strict(text: str) -> bool:
     if is_gibberish(text):
         return False
 
-    # Doit contenir au moins 4 mots
+    # Minimum 4 mots
     if len(text.split()) < 4:
         return False
 
+    # Doit contenir au moins UN mot clé fort
     return any(k in text for k in POSTE_KEYWORDS)
+
 
 
 def detect_no_poste(text: str) -> bool:
@@ -281,12 +283,13 @@ def detect_no_poste(text: str) -> bool:
 def detect_no_cv(text: str) -> bool:
     return any(k in text for k in NO_CV_KEYWORDS)
 
-def detect_cv(text: str) -> bool:
+def detect_cv_strict(text: str) -> bool:
     return (
-        ("experience" in text or "expérience" in text)
+        len(text) > 800
+        and ("experience" in text or "expérience" in text)
         and ("education" in text or "formation" in text)
-        and len(text) > 800
     )
+
 
 def merge_text(history: List[Message], latest: str) -> str:
     return " ".join([m.content for m in history] + [latest])
@@ -301,50 +304,49 @@ async def analyze(payload: AnalyzeRequest):
     user_text = normalize(payload.query)
 
     # =====================================================
-    # 1️⃣ NON-SENS / CLAVIER ALÉATOIRE — STOP IMMÉDIAT
+    # 1️⃣ BRUIT / CLAVIER ALÉATOIRE → réponse humaine
     # =====================================================
     if is_gibberish(user_text):
         return AnalyzeResponse(
             response=(
-                "😅 Je crois que votre message ne voulait rien dire.\n\n"
-                "👉 Essayez par exemple :\n"
-                "• « Je cherche un emploi »\n"
-                "• « Je veux analyser mon CV »\n"
-                "• « Je ne sais pas encore quel poste viser »"
+                "😅 Je n’ai pas très bien compris ce message.\n\n"
+                "Mais pas de souci — dites-moi simplement ce que vous avez en tête 🙂\n\n"
+                "Par exemple :\n"
+                "• chercher un emploi\n"
+                "• améliorer un CV\n"
+                "• discuter de votre parcours\n"
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 2️⃣ SALUTATION (AVANT TOUTE AUTRE LOGIQUE)
+    # 2️⃣ SALUTATION → accueil humain
     # =====================================================
     if is_greeting(user_text):
         return AnalyzeResponse(
             response=(
                 "Bonjour 👋\n\n"
-                "Je suis **SenJobCoach**, votre coach carrière.\n\n"
-                "Je peux vous aider à :\n"
-                "• analyser votre CV\n"
-                "• identifier un poste adapté\n"
-                "• améliorer votre positionnement professionnel\n\n"
-                "Que souhaitez-vous faire aujourd’hui 🙂 ?"
+                "Ravi de vous rencontrer !\n\n"
+                "Je suis **SenJobCoach** et je peux vous aider à réfléchir à votre parcours, "
+                "à améliorer votre CV ou simplement à discuter de vos projets.\n\n"
+                "Qu’aimeriez-vous faire aujourd’hui ? 🙂"
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 3️⃣ INTENTIONS EXPLICITES
+    # 3️⃣ CAS HUMAINS (pas de poste / pas de CV)
     # =====================================================
     if detect_no_poste(user_text):
         return AnalyzeResponse(
             response=(
-                "C’est tout à fait normal 👍\n\n"
-                "Nous pouvons commencer sans poste précis.\n\n"
-                "👉 Parlez-moi de :\n"
+                "Merci pour votre honnêteté 🙏\n\n"
+                "Ne pas avoir encore de poste précis est très courant.\n\n"
+                "On peut commencer par discuter de :\n"
                 "• votre domaine\n"
-                "• votre expérience\n"
-                "• ce que vous aimeriez faire\n\n"
-                "Je vous guiderai pas à pas."
+                "• vos expériences\n"
+                "• ce que vous aimeriez faire à moyen terme\n\n"
+                "Parlez-moi simplement de vous."
             ),
             session_id=session_id
         )
@@ -353,47 +355,59 @@ async def analyze(payload: AnalyzeRequest):
         return AnalyzeResponse(
             response=(
                 "Aucun souci 🙂\n\n"
-                "Même sans CV finalisé, je peux vous aider.\n\n"
-                "👉 Vous pouvez :\n"
+                "Un CV n’a pas besoin d’être parfait pour commencer.\n\n"
+                "Vous pouvez :\n"
                 "• décrire vos expériences\n"
                 "• partager un brouillon\n"
-                "• ou expliquer vos objectifs\n\n"
-                "Que préférez-vous ?"
+                "• ou simplement expliquer ce que vous voulez améliorer\n\n"
+                "Je m’adapte."
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 4️⃣ DÉTECTION POSTE / CV (SÉCURISÉE)
+    # 4️⃣ DÉTECTION FORTE SEULEMENT
     # =====================================================
-    has_poste = detect_poste_safe(user_text)
-    has_cv = detect_cv(user_text)
+    has_poste = detect_poste_strict(user_text)
+    has_cv = detect_cv_strict(user_text)
 
     # =====================================================
-    # 5️⃣ GUIDAGE
+    # 5️⃣ SI RIEN DE CLAIR → DISCUSSION LIBRE (IMPORTANT)
     # =====================================================
     if not has_poste and not has_cv:
+        # 👉 ici on laisse ChatGPT répondre naturellement
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": payload.query}
+        ]
+
+        completion = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7  # plus humain
+        )
+
         return AnalyzeResponse(
-            response=(
-                "Pour bien commencer 🎯\n\n"
-                "Quel est **le poste ou le domaine professionnel que vous visez** ?\n\n"
-                "Ou bien dites-moi simplement ce que vous cherchez."
-            ),
+            response=completion.choices[0].message.content,
             session_id=session_id
         )
 
+    # =====================================================
+    # 6️⃣ POSTE OK MAIS PAS DE CV
+    # =====================================================
     if has_poste and not has_cv:
         return AnalyzeResponse(
             response=(
                 "Parfait 👍\n\n"
-                "Pour continuer, j’ai besoin de **votre CV complet**.\n\n"
-                "👉 Copiez-collez le CV (expérience, formation, compétences)."
+                "Pour aller plus loin et vous donner une analyse utile, "
+                "j’aurai besoin de **votre CV complet**.\n\n"
+                "Dès que vous êtes prêt, copiez-collez-le ici."
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 6️⃣ ANALYSE IA (SEULEMENT ICI)
+    # 7️⃣ ANALYSE COMPLÈTE (SEULEMENT ICI)
     # =====================================================
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in payload.history:
