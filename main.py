@@ -239,28 +239,41 @@ def detect_intent(text: str) -> str:
 
 
 def is_gibberish(text: str) -> bool:
+    text = text.strip()
+
     # Trop court
-    if len(text) < 5:
+    if len(text) < 6:
         return True
 
-    # Un seul "mot" bizarre
-    if len(text.split()) == 1 and len(text) < 6:
+    words = text.split()
+
+    # 1–2 mots non informatifs
+    if len(words) < 2:
         return True
 
-    # Peu de voyelles → souvent du bruit
-    vowels = re.findall(r"[aeiouy]", text)
+    # Peu de voyelles → bruit clavier
+    vowels = re.findall(r"[aeiouyAEIOUY]", text)
     if len(vowels) < 2:
         return True
 
-    # Trop peu de diversité de caractères
-    if len(set(text)) < 4:
+    # Trop peu de diversité
+    if len(set(text)) < 6:
         return True
 
     return False
 
 
+
 def detect_poste(text: str) -> bool:
+    if is_gibberish(text):
+        return False
+
+    # Doit contenir au moins 4 mots
+    if len(text.split()) < 4:
+        return False
+
     return any(k in text for k in POSTE_KEYWORDS)
+
 
 def detect_no_poste(text: str) -> bool:
     return any(k in text for k in NO_POSTE_KEYWORDS)
@@ -288,112 +301,99 @@ async def analyze(payload: AnalyzeRequest):
     user_text = normalize(payload.query)
 
     # =====================================================
-    # 1️⃣ BRUIT / NON-SENS — PRIORITÉ ABSOLUE
+    # 1️⃣ NON-SENS / CLAVIER ALÉATOIRE — STOP IMMÉDIAT
     # =====================================================
     if is_gibberish(user_text):
         return AnalyzeResponse(
             response=(
-                "Désolé, je n’ai pas compris votre message 🙂\n\n"
-                "👉 Vous pouvez par exemple écrire :\n"
-                "• « Je veux analyser mon CV »\n"
+                "😅 Je crois que votre message ne voulait rien dire.\n\n"
+                "👉 Essayez par exemple :\n"
                 "• « Je cherche un emploi »\n"
+                "• « Je veux analyser mon CV »\n"
                 "• « Je ne sais pas encore quel poste viser »"
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 2️⃣ DÉTECTION D’INTENTION (MESSAGE ACTUEL)
+    # 2️⃣ SALUTATION (AVANT TOUTE AUTRE LOGIQUE)
     # =====================================================
-    intent = detect_intent(user_text)
-
-    # =====================================================
-    # 3️⃣ PAS DE CV
-    # =====================================================
-    if intent == "NO_CV":
-        return AnalyzeResponse(
-            response=(
-                "Pas de souci 👍\n\n"
-                "Nous pouvons avancer même sans CV finalisé.\n\n"
-                "👉 Vous pouvez :\n"
-                "• décrire vos expériences\n"
-                "• partager un CV brouillon\n"
-                "• ou me dire ce que vous souhaitez améliorer\n\n"
-                "Que préférez-vous faire ?"
-            ),
-            session_id=session_id
-        )
-
-    # =====================================================
-    # 4️⃣ PAS DE POSTE
-    # =====================================================
-    if intent == "NO_POSTE":
-        return AnalyzeResponse(
-            response=(
-                "C’est tout à fait normal de ne pas avoir encore un poste précis 🙏\n\n"
-                "Pour vous orienter efficacement, dites-moi :\n"
-                "• votre domaine (data, IT, finance, humanitaire…)\n"
-                "• votre niveau (junior, confirmé, senior)\n"
-                "• vos objectifs professionnels\n\n"
-                "Expliquez-moi simplement votre situation."
-            ),
-            session_id=session_id
-        )
-
-    # =====================================================
-    # 5️⃣ SALUTATION (APRÈS INTENTIONS)
-    # =====================================================
-    if intent == "HELLO":
+    if is_greeting(user_text):
         return AnalyzeResponse(
             response=(
                 "Bonjour 👋\n\n"
                 "Je suis **SenJobCoach**, votre coach carrière.\n\n"
                 "Je peux vous aider à :\n"
                 "• analyser votre CV\n"
-                "• l’adapter à un poste précis\n"
-                "• clarifier votre positionnement professionnel\n\n"
-                "Que souhaitez-vous faire ? 🙂"
+                "• identifier un poste adapté\n"
+                "• améliorer votre positionnement professionnel\n\n"
+                "Que souhaitez-vous faire aujourd’hui 🙂 ?"
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 6️⃣ DÉTECTION POSTE / CV
+    # 3️⃣ INTENTIONS EXPLICITES
     # =====================================================
-    has_poste_now = detect_poste(user_text)
-    has_cv_now = detect_cv(user_text)
+    if detect_no_poste(user_text):
+        return AnalyzeResponse(
+            response=(
+                "C’est tout à fait normal 👍\n\n"
+                "Nous pouvons commencer sans poste précis.\n\n"
+                "👉 Parlez-moi de :\n"
+                "• votre domaine\n"
+                "• votre expérience\n"
+                "• ce que vous aimeriez faire\n\n"
+                "Je vous guiderai pas à pas."
+            ),
+            session_id=session_id
+        )
 
-    if has_poste_now and len(user_text.split()) < 4:
-        has_poste_now = False
+    if detect_no_cv(user_text):
+        return AnalyzeResponse(
+            response=(
+                "Aucun souci 🙂\n\n"
+                "Même sans CV finalisé, je peux vous aider.\n\n"
+                "👉 Vous pouvez :\n"
+                "• décrire vos expériences\n"
+                "• partager un brouillon\n"
+                "• ou expliquer vos objectifs\n\n"
+                "Que préférez-vous ?"
+            ),
+            session_id=session_id
+        )
 
     # =====================================================
-    # 7️⃣ RIEN DE CLAIR → GUIDAGE
+    # 4️⃣ DÉTECTION POSTE / CV (SÉCURISÉE)
     # =====================================================
-    if not has_poste_now and not has_cv_now:
+    has_poste = detect_poste_safe(user_text)
+    has_cv = detect_cv(user_text)
+
+    # =====================================================
+    # 5️⃣ GUIDAGE
+    # =====================================================
+    if not has_poste and not has_cv:
         return AnalyzeResponse(
             response=(
                 "Pour bien commencer 🎯\n\n"
                 "Quel est **le poste ou le domaine professionnel que vous visez** ?\n\n"
-                "Vous pouvez aussi coller une fiche de poste (Job Description)."
+                "Ou bien dites-moi simplement ce que vous cherchez."
             ),
             session_id=session_id
         )
 
-    # =====================================================
-    # 8️⃣ POSTE OK MAIS PAS DE CV
-    # =====================================================
-    if has_poste_now and not has_cv_now:
+    if has_poste and not has_cv:
         return AnalyzeResponse(
             response=(
-                "Parfait, merci pour le poste ciblé ✅\n\n"
-                "Pour continuer, j’ai maintenant besoin de **votre CV complet**.\n\n"
-                "👉 Copiez-collez l’ensemble du CV (expérience, formation, compétences)."
+                "Parfait 👍\n\n"
+                "Pour continuer, j’ai besoin de **votre CV complet**.\n\n"
+                "👉 Copiez-collez le CV (expérience, formation, compétences)."
             ),
             session_id=session_id
         )
 
     # =====================================================
-    # 9️⃣ ANALYSE IA (SEULEMENT ICI)
+    # 6️⃣ ANALYSE IA (SEULEMENT ICI)
     # =====================================================
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for m in payload.history:
