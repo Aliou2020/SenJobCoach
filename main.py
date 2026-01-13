@@ -1,19 +1,32 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi.responses import FileResponse
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from typing import Optional
 import openai
 import uuid
-import re
+import json
 import os
+import io
+import re
+import tempfile
+import pdfplumber
+import docx
 from dotenv import load_dotenv
 
+PDF_STORE = {} 
+
+# ------------------------
+# INIT
+# ------------------------
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
-# CORS pour autoriser ton site PHP
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,26 +34,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ------------------------
-# MODELS
-# ------------------------
 
-class Message(BaseModel):
-    role: str  # "user" | "assistant"
-    content: str
-
-class AnalyzeRequest(BaseModel):
-    query: str
-    history: List[Message] = []
-    session_id: Optional[str] = None
-
-class AnalyzeResponse(BaseModel):
-    response: str
-    session_id: str
 # ------------------------
-# SYSTEM PROMPT
+# SYSTEM PROMPTS
 # ------------------------
-
 SYSTEM_PROMPT = """
 Tu es SenJobCoach, un coach carrière senior, humain, chaleureux et expert.
 
@@ -54,373 +51,277 @@ IMPORTANT :
 
 Quand les conditions sont réunies (poste + CV complet), réalise une analyse professionnelle structurée.
 
-Structure obligatoire de l’analyse :
-1. Résumé du profil
-2. Niveau de séniorité estimé
-3. Score global du CV (0–100)
-4. Score de compatibilité avec le poste (0–100)
-5. Compétences techniques
-6. Compétences comportementales
-7. Points forts
-8. Axes d’amélioration
-9. Recommandations personnalisées
+Agis comme un expert RH et recruteur senior IT intervenant dans des tout type de contexte.
+
+Analyse de manière approfondie l’adéquation entre le CV ci-dessous et
+l’offre d’emploi ci-dessous.
+
+
+
+Livrables attendus :
+1. Score d’adéquation global (%) avec justification.
+2. Analyse détaillée par dimension :
+   - Responsabilités opérationnelles
+   - Compétences techniques (réseaux, systèmes, sécurité, outils)
+   - Expérience terrain / environnements critiques
+   - Collaboration transverse et gouvernance
+   - Soft skills et culture HSE
+3. Tableaux comparatifs clairs pour chaque dimension.
+4. Identification explicite :
+   - des points forts différenciants
+   - des écarts ou risques perçus par un recruteur
+5. Recommandations concrètes :
+   - ajustements du CV (phrases exactes à ajouter)
+   - éléments à mettre en avant en entretien
+6. Conclusion sous forme de note recruteur (go / no-go / go avec ajustements).
+
+Quand tu dois afficher des données structurées :
+- Utilise uniquement du HTML valide
+- N’utilise PAS de Markdown
+- Ajoute des titres <h4> 
+- Reste clair et lisible
+
+
+
+
+Contraintes de forme :
+- Réponse très structurée
+- Titres numérotés
+- Tableaux lisibles
+- Ton neutre, professionnel, orienté décision.
+
 
 Utilise un ton :
 - Humain
 - Bienveillant
 - Professionnel
 - Clair
+
+Règles :
+- Réponds naturellement aux messages simples.
+- Si un CV est fourni, analyse-le sérieusement.
+- Structure clairement les réponses longues.
+- Ne révèle jamais ton raisonnement interne.
+"""
+
+CV_ANALYSIS_PROMPT = """
+Analyse le CV Si lui  seul est present.
+
+Produis une réponse structurée avec :
+
+1. Résumé du profil
+2. Niveau de séniorité estimé
+3. Expériences clés
+4. Compétences techniques
+5. Compétences comportementales
+6. Points forts
+7. Axes d’amélioration
+8. Score global du CV sur 100 (avec justification courte)
+9. Un tableau d’évaluation avec :
+   - les grandes dimensions du poste
+   - le poids de chaque dimension (%)
+   - mon niveau d’adéquation
+   - un score chiffré par dimension sur 10
+   - Un score global sur 100
+   - Un court verdict recruteur (shortlist / risque / points forts)
+   - Des recommandations concrètes pour améliorer mon CV et atteindre +90/100
+   - Présente le récapitulatif sous forme de table clair et lisible.
+   - Adopte un ton professionnel, direct et orienté décision.
+10. Pour chaque score, représenter visuellement la valeur à l’aide
+d’une barre ASCII de longueur fixe (ex : 12 ou 20 caractères),
+avec :
+- █ en couleur verte pour la partie remplie
+- ░ pour la partie vide
+- le pourcentage affiché à droite.
+
 """
 
 # ------------------------
-# DETECTION LOGIC
+# HELPERS
 # ------------------------
+def extract_cv_text(file: UploadFile) -> str:
+    """
+    Lecture réelle PDF & DOCX
+    """
+    text = ""
 
-POSTE_KEYWORDS = [
-    # Termes generaux
-    "poste", "job", "emploi", "position", "intitule", "fonction", "role",
+    filename = file.filename.lower()
+    content = file.file.read()
 
-    # Description de poste
-    "description de poste", "fiche de poste", "jd", "job description",
-    "offre", "offre d emploi", "annonce", "annonce d emploi",
+    if filename.endswith(".pdf"):
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
 
-    # Intention de candidature
-    "je vise", "je postule", "je candidate", "je veux postuler",
-    "je souhaite postuler", "je cherche un poste",
-    "je cherche un emploi", "je recherche un emploi",
+    elif filename.endswith(".docx"):
+        doc = docx.Document(io.BytesIO(content))
+        for para in doc.paragraphs:
+            text += para.text + "\n"
 
-    # Actions liees au poste
-    "candidature", "postuler", "postulation", "deposer ma candidature",
-    "soumettre ma candidature", "envoyer ma candidature",
-
-    # Ciblage du poste
-    "poste vise", "job vise", "poste cible", "position cible",
-    "poste souhaite", "job souhaite",
-
-    # Expressions conversationnelles
-    "pour ce poste", "pour ce job", "pour cette position",
-    "par rapport au poste", "par rapport au job",
-
-    # Contexte recrutement
-    "recrutement", "processus de recrutement",
-    "selection", "shortlist", "profil recherche",
-
-    # Variantes / fautes courantes
-    "post", "jobe", "emplois", "jobb",
-    "je postule a", "je vise un poste", "jd poste"
-]
-
-HELLO_KEYWORDS = [
-    # Salutations simples
-    "salut", "bonjour", "bonsoir", "coucou", "hello", "hi", "hey",
-    "allo", "allô", "bon matin", "bon apres midi", "bonne journee",
-
-    # Salutations polies / professionnelles
-    "bonjour monsieur", "bonjour madame", "bonjour a vous", "bonsoir a vous",
-    "enchante", "ravi de vous rencontrer", "au plaisir de vous lire",
-    "cordialement",
-
-    # Salutations informelles / amicales
-    "salut tout le monde", "hey salut", "coucou toi", "wesh", "yo",
-    "ca dit quoi", "quoi de neuf",
-
-    # Démarrage de discussion
-    "comment ca va", "comment allez vous", "comment vas tu",
-    "ca va", "tu vas bien", "tout va bien",
-    "comment se passe ta journee",
-
-    # Réponses courantes
-    "ca va bien", "tres bien merci", "pas mal", "comme ci comme ca",
-    "tranquillement", "on fait aller", "ca va et toi",
-
-    # Relances
-    "et toi", "et vous", "des nouvelles", "quoi de nouveau",
-    "tu fais quoi", "que puis je faire pour toi",
-    "comment puis je aider", "de quoi veux tu parler",
-
-    # Politesse / interaction
-    "merci", "merci beaucoup", "je vous remercie",
-    "s il te plait", "s il vous plait", "avec plaisir",
-    "pas de souci", "aucun probleme", "d accord", "tres bien",
-
-    # Clôture
-    "au revoir", "a bientot", "a plus tard", "bonne soiree",
-    "a tout a l heure", "a la prochaine", "merci et a bientot",
-
-    # Expressions courtes fréquentes
-    "peut etre", "bien sur",
-    "je comprends", "compris", "interessant", "c est clair",
-
-    # Variantes / fautes courantes (chat)
-    "bonjourr", "slt", "bjr", "bsr", "salu",
-     "sava", "commen sa va", "comen tu va"
-]
-
-
-NO_POSTE_KEYWORDS = [
-    # Absence explicite de poste
-    "pas de poste", "aucun poste", "pas encore de poste",
-    "je n ai pas de poste", "je n ai pas encore de poste",
-    "je ne vise aucun poste",
-
-    # Incertitude / hésitation
-    "je ne sais pas quel poste", "je ne sais pas quel job",
-    "je ne sais pas quoi viser", "je ne sais pas encore",
-    "je ne sais pas quel emploi",
-
-    # Recherche generale
-    "je cherche un job", "je cherche un emploi",
-    "je cherche du travail", "je suis en recherche d emploi",
-    "je suis a la recherche d un emploi",
-
-    # Ouverture / exploration
-    "je suis ouvert", "je suis ouvert a tout",
-    "tous types de postes", "tout type de job",
-    "peu importe le poste",
-
-    # Expressions conversationnelles
-    "pas pour le moment", "pas encore decide",
-    "pas defini", "non defini",
-
-    # Variantes / fautes courantes
-    "pas poste", "aucun job", "no job",
-    "je sai pas", "je sais pa encore"
-]
-
-NO_CV_KEYWORDS = [
-    # Absence explicite de CV
-    "pas de cv", "je n ai pas de cv", "je n ai aucun cv",
-    "pas encore de cv", "je n ai pas encore de cv",
-
-    # CV non pret / en cours
-    "cv pas pret", "mon cv n est pas pret",
-    "cv en cours", "cv en preparation",
-    "je travaille sur mon cv",
-
-    # Oubli / indisponibilite
-    "je n ai pas mon cv", "je n ai pas mon cv sur moi",
-    "je ne retrouve pas mon cv", "cv indisponible",
-
-    # Incertitude / hesitation
-    "je ne sais pas si mon cv est pret",
-    "mon cv n est pas a jour", "cv pas a jour",
-
-    # Ouverture / alternatives
-    "je peux le faire plus tard",
-    "plus tard pour le cv",
-    "je ferai le cv apres",
-
-    # Expressions conversationnelles
-    "pas maintenant", "pas pour le moment",
-
-    # Variantes / fautes courantes (chat)
-    "pa de cv", "pas cv", "cv pa pret",
-    "j ai pa de cv", "g pa de cv"
-]
-
-
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text.lower()).strip()
-
-def is_greeting(text: str) -> bool:
-    return any(text.startswith(k) for k in HELLO_KEYWORDS)
-
-    
-def detect_intent(text: str) -> str:
-    if detect_no_cv(text):
-        return "NO_CV"
-    if detect_no_poste(text):
-        return "NO_POSTE"
-    if detect_poste(text):
-        return "POSTE"
-    if is_greeting(text):
-        return "HELLO"
-    return "UNKNOWN"
+    return text.strip()
 
 
 def is_gibberish(text: str) -> bool:
     text = text.strip()
-
-    # Trop court
-    if len(text) < 6:
+    if len(text) < 5:
         return True
-
-    words = text.split()
-
-    # 1–2 mots non informatifs
-    if len(words) < 2:
-        return True
-
-    # Peu de voyelles → bruit clavier
     vowels = re.findall(r"[aeiouyAEIOUY]", text)
-    if len(vowels) < 2:
-        return True
+    return len(vowels) < 2
 
-    # Trop peu de diversité
-    if len(set(text)) < 6:
-        return True
+def generate_pdf(analysis_text: str, session_id: str) -> str:
+    """
+    Génère un PDF simple à partir du texte IA
+    Retourne le chemin du fichier
+    """
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf_path = temp_file.name
 
-    return False
-
-
-
-def detect_poste_strict(text: str) -> bool:
-    if is_gibberish(text):
-        return False
-
-    # Minimum 4 mots
-    if len(text.split()) < 4:
-        return False
-
-    # Doit contenir au moins UN mot clé fort
-    return any(k in text for k in POSTE_KEYWORDS)
-
-
-
-def detect_no_poste(text: str) -> bool:
-    return any(k in text for k in NO_POSTE_KEYWORDS)
-
-def detect_no_cv(text: str) -> bool:
-    return any(k in text for k in NO_CV_KEYWORDS)
-
-def detect_cv_strict(text: str) -> bool:
-    return (
-        len(text) > 800
-        and ("experience" in text or "expérience" in text)
-        and ("education" in text or "formation" in text)
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        rightMargin=2*cm,
+        leftMargin=2*cm,
+        topMargin=2*cm,
+        bottomMargin=2*cm
     )
 
+    styles = getSampleStyleSheet()
+    story = []
 
-def merge_text(history: List[Message], latest: str) -> str:
-    return " ".join([m.content for m in history] + [latest])
+    story.append(Paragraph("<b>Analyse de CV – SenJobCoach</b>", styles["Title"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"<b>Session :</b> {session_id}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    for line in analysis_text.split("\n"):
+        story.append(Paragraph(line.replace("&", "&amp;"), styles["Normal"]))
+        story.append(Spacer(1, 6))
+
+    doc.build(story)
+
+    return pdf_path
+
 
 # ------------------------
-# ENDPOINT
+# ENDPOINT PRINCIPAL
 # ------------------------
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(payload: AnalyzeRequest):
+@app.post("/analyze")
+async def analyze(
+    query: str = Form(""),
+    history: str = Form("[]"),
+    session_id: Optional[str] = Form(None),
+    cv: Optional[UploadFile] = File(None)
+):
+    session_id = session_id or str(uuid.uuid4())
+    analysis_ready = False
 
-    session_id = payload.session_id or str(uuid.uuid4())
-    user_text = normalize(payload.query)
+    try:
+        history_messages = json.loads(history)
+    except Exception:
+        history_messages = []
 
-    # =====================================================
-    # 1️⃣ BRUIT / CLAVIER ALÉATOIRE → réponse humaine
-    # =====================================================
-    if is_gibberish(user_text):
-        return AnalyzeResponse(
-            response=(
-                "😅 Je n’ai pas très bien compris ce message.\n\n"
-                "Mais pas de souci — dites-moi simplement ce que vous avez en tête 🙂\n\n"
-                "Par exemple :\n"
-                "• chercher un emploi\n"
-                "• améliorer un CV\n"
-                "• discuter de votre parcours\n"
-            ),
-            session_id=session_id
-        )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # =====================================================
-    # 2️⃣ SALUTATION → accueil humain
-    # =====================================================
-    if is_greeting(user_text):
-        return AnalyzeResponse(
-            response=(
-                "Bonjour 👋\n\n"
-                "Ravi de vous rencontrer !\n\n"
-                "Je suis **SenJobCoach** et je peux vous aider à réfléchir à votre parcours, "
-                "à améliorer votre CV ou simplement à discuter de vos projets.\n\n"
-                "Qu’aimeriez-vous faire aujourd’hui ? 🙂"
-            ),
-            session_id=session_id
-        )
+    for msg in history_messages:
+        if "role" in msg and "content" in msg:
+            messages.append(msg)
 
-    # =====================================================
-    # 3️⃣ CAS HUMAINS (pas de poste / pas de CV)
-    # =====================================================
-    if detect_no_poste(user_text):
-        return AnalyzeResponse(
-            response=(
-                "Merci pour votre honnêteté 🙏\n\n"
-                "Ne pas avoir encore de poste précis est très courant.\n\n"
-                "On peut commencer par discuter de :\n"
-                "• votre domaine\n"
-                "• vos expériences\n"
-                "• ce que vous aimeriez faire à moyen terme\n\n"
-                "Parlez-moi simplement de vous."
-            ),
-            session_id=session_id
-        )
+    # =========================
+    # CV UPLOAD
+    # =========================
+    if cv:
+        cv_text = extract_cv_text(cv)
 
-    if detect_no_cv(user_text):
-        return AnalyzeResponse(
-            response=(
-                "Aucun souci 🙂\n\n"
-                "Un CV n’a pas besoin d’être parfait pour commencer.\n\n"
-                "Vous pouvez :\n"
-                "• décrire vos expériences\n"
-                "• partager un brouillon\n"
-                "• ou simplement expliquer ce que vous voulez améliorer\n\n"
-                "Je m’adapte."
-            ),
-            session_id=session_id
-        )
+        if not cv_text or len(cv_text) < 200:
+            return {
+                "response": (
+                    "⚠️ Je n’ai pas réussi à lire correctement le CV.\n\n"
+                    "Merci d’essayer avec un fichier PDF ou Word bien lisible."
+                ),
+                "session_id": session_id,
+                "analysis_ready": False
+            }
+            
+        analysis_ready = True
+        messages.append({
+            "role": "system",
+            "content": CV_ANALYSIS_PROMPT + cv_text
+        })
 
-    # =====================================================
-    # 4️⃣ DÉTECTION FORTE SEULEMENT
-    # =====================================================
-    has_poste = detect_poste_strict(user_text)
-    has_cv = detect_cv_strict(user_text)
+        messages.append({
+            "role": "user",
+            "content": query or "Analyse complète de ce CV"
+        })
 
-    # =====================================================
-    # 5️⃣ SI RIEN DE CLAIR → DISCUSSION LIBRE (IMPORTANT)
-    # =====================================================
-    if not has_poste and not has_cv:
-        # 👉 ici on laisse ChatGPT répondre naturellement
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": payload.query}
-        ]
+    # =========================
+    # MESSAGE TEXTE
+    # =========================
+    else:
+        if is_gibberish(query):
+            return {
+                "response": (
+                    "🙂 Je n’ai pas bien compris.\n\n"
+                    "Vous pouvez :\n"
+                    "• poser une question\n"
+                    "• uploader votre CV\n"
+                    "• parler de votre projet professionnel"
+                ),
+                "session_id": session_id
+            }
 
+        messages.append({
+            "role": "user",
+            "content": query or "Bonjour"
+        })
+
+    # =========================
+    # OPENAI
+    # =========================
+    try:
         completion = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0.7  # plus humain
+            temperature=0.4
         )
 
-        return AnalyzeResponse(
-            response=completion.choices[0].message.content,
-            session_id=session_id
+        response_text = completion.choices[0].message.content
+       
+        
+
+    except Exception:
+        response_text = (
+            "😕 Désolé, un problème technique est survenu.\n"
+            "Merci de réessayer."
         )
 
-    # =====================================================
-    # 6️⃣ POSTE OK MAIS PAS DE CV
-    # =====================================================
-    if has_poste and not has_cv:
-        return AnalyzeResponse(
-            response=(
-                "Parfait 👍\n\n"
-                "Pour aller plus loin et vous donner une analyse utile, "
-                "j’aurai besoin de **votre CV complet**.\n\n"
-                "Dès que vous êtes prêt, copiez-collez-le ici."
-            ),
-            session_id=session_id
-        )
+    # =========================
+    # PDF EXPORT (SI ANALYSE CV)
+    # =========================
+    pdf_path = None
+    if cv:
+        pdf_path = generate_pdf(response_text, session_id)
+        PDF_STORE[session_id] = pdf_path
 
-    # =====================================================
-    # 7️⃣ ANALYSE COMPLÈTE (SEULEMENT ICI)
-    # =====================================================
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for m in payload.history:
-        messages.append({"role": m.role, "content": m.content})
-    messages.append({"role": "user", "content": payload.query})
+    return {
+        "response": response_text,
+        "session_id": session_id,
+        "analysis_ready": analysis_ready,
+        "pdf_available": bool(pdf_path)
+    }
 
-    completion = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.3
+
+
+
+@app.get("/download-pdf/{session_id}")
+async def download_pdf(session_id: str):
+    pdf_path = PDF_STORE.get(session_id)
+
+    if not pdf_path or not os.path.exists(pdf_path):
+        return {"error": "PDF non trouvé"}
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"Analyse_CV_{session_id}.pdf"
     )
 
-    return AnalyzeResponse(
-        response=completion.choices[0].message.content,
-        session_id=session_id
-    )
