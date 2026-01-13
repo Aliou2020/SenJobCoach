@@ -4,5 +4,7 @@ openai
 pydantic
 python-dotenv
 reportlab
-
+pdfplumber
+python-docx
+python-multipart
 
